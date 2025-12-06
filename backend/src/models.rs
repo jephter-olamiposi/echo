@@ -1,35 +1,63 @@
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-// 1. What the client sends to register
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
+    pub first_name: String,
+    pub last_name: String,
     pub email: String,
     pub password: String,
 }
 
-// 2. What the client sends to log in
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
 }
 
-// 3. What we send back on success
-#[derive(Serialize)]
-pub struct LoginResponse {
+#[derive(Debug, Serialize)]
+pub struct AuthResponse {
     pub token: String,
 }
 
-// 4. The data inside the JWT (The "Claims")
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String, // Subject (User ID)
-    pub exp: usize,  // Expiration Timestamp
-    pub iat: usize,  // Issued At Timestamp
+    pub sub: String,
+    pub exp: usize,
+    pub iat: usize,
 }
 
-// 5. Query parameters for WebSocket connection
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct WsQuery {
     pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardMessage {
+    pub device_id: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+    #[serde(default)]
+    pub encrypted: bool,
+    pub timestamp: u64,
+}
+
+impl ClipboardMessage {
+    pub fn new(device_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            device_id: device_id.into(),
+            content: content.into(),
+            nonce: None,
+            encrypted: false,
+            timestamp: now_millis(),
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

@@ -1,2 +1,37 @@
+# Build artifacts
 /target
+**/target
+
+# Environment files
 .env
+.env.local
+.env.*.local
+*.env
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+
+# Tauri
+desktop/src-tauri/target/
+desktop/src-tauri/gen/schemas
+
+# OS
+Thumbs.db
+
+# Debug
+*.pdb
+*.dSYM/

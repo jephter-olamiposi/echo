@@ -1,149 +1,132 @@
 use crate::{
     error::AppError,
     middleware::AuthUser,
-    models::{Claims, LoginRequest, LoginResponse, RegisterRequest, WsQuery},
+    models::{AuthResponse, Claims, ClipboardMessage, LoginRequest, RegisterRequest, WsQuery},
     state::AppState,
 };
-use argon2::password_hash::rand_core::OsRng;
-use argon2::{Argon2, PasswordHasher, PasswordVerifier, password_hash::SaltString};
+use argon2::{
+    password_hash::{rand_core::OsRng, SaltString},
+    Argon2, PasswordHasher, PasswordVerifier,
+};
 use axum::{
-    Json,
     extract::{
-        Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
+        Query, State, WebSocketUpgrade,
     },
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
-use futures::{sink::SinkExt, stream::StreamExt};
-use jsonwebtoken::{EncodingKey, Header, encode};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use futures::{SinkExt, StreamExt};
+use jsonwebtoken::{encode, EncodingKey, Header};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-pub async fn protected(AuthUser { user_id }: AuthUser) -> impl IntoResponse {
-    format!("Welcome to the protected area! Your ID is: {}", user_id)
-}
+const JWT_EXPIRY_HOURS: u64 = 24;
+const PING_INTERVAL_SECS: u64 = 30;
 
 pub async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // 1. Find User by Email
     let user = sqlx::query!(
         "SELECT id, password_hash FROM users WHERE email = $1",
         payload.email
     )
     .fetch_optional(&state.pool)
-    .await
-    .map_err(AppError::DatabaseError)?
-    .ok_or_else(|| AppError::AuthError("Invalid credentials".to_string()))?;
+    .await?
+    .ok_or_else(|| AppError::Auth("Invalid credentials".into()))?;
 
-    // 2. Verify Password (Argon2)
-    // We run this blocking operation on a separate thread to avoid freezing the server.
-    let password_hash = user.password_hash.clone();
-    let password = payload.password.clone();
+    let hash = user.password_hash.clone();
+    let password = payload.password;
 
-    let is_valid = tokio::task::spawn_blocking(move || {
-        let parsed_hash = argon2::PasswordHash::new(&password_hash).ok()?;
-        let valid = Argon2::default()
-            .verify_password(password.as_bytes(), &parsed_hash)
-            .is_ok();
-        Some(valid)
+    let valid = tokio::task::spawn_blocking(move || {
+        argon2::PasswordHash::new(&hash)
+            .ok()
+            .map(|h| {
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &h)
+                    .is_ok()
+            })
+            .unwrap_or(false)
     })
-    .await
-    .map_err(|e| AppError::InternalServerError(e.to_string()))?
-    .unwrap_or(false);
+    .await?;
 
-    if !is_valid {
-        return Err(AppError::AuthError("Invalid credentials".to_string()));
+    if !valid {
+        return Err(AppError::Auth("Invalid credentials".into()));
     }
 
-    // 3. Generate JWT
-    // Expiration: Current Time + 24 Hours
-    let expiration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as usize
-        + (24 * 60 * 60);
-
-    let claims = Claims {
-        sub: user.id.to_string(),
-        exp: expiration,
-        iat: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as usize,
-    };
-
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    )
-    .map_err(|e| AppError::InternalServerError(format!("Token creation failed: {}", e)))?;
-
-    Ok((StatusCode::OK, Json(LoginResponse { token })))
+    let token = generate_jwt(user.id, &state.jwt_secret)?;
+    Ok((StatusCode::OK, Json(AuthResponse { token })))
 }
 
 pub async fn register(
     State(state): State<AppState>,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // 1. Hash Password with Argon2
     let salt = SaltString::generate(&mut OsRng);
-    let password = payload.password.clone();
+    let password = payload.password;
 
-    let password_hash = tokio::task::spawn_blocking(move || {
+    let hash = tokio::task::spawn_blocking(move || {
         Argon2::default()
             .hash_password(password.as_bytes(), &salt)
-            .map(|hash| hash.to_string())
+            .map(|h| h.to_string())
     })
-    .await
-    .map_err(|e| AppError::InternalServerError(e.to_string()))?
-    .map_err(|e| AppError::InternalServerError(format!("Password hashing failed: {}", e)))?;
+    .await?
+    .map_err(|e| AppError::Internal(format!("Hash failed: {e}")))?;
 
-    // 2. Insert User into Database
     let result = sqlx::query!(
-        "INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id",
+        "INSERT INTO users (first_name, last_name, email, password_hash) VALUES ($1, $2, $3, $4) RETURNING id",
+        payload.first_name,
+        payload.last_name,
         payload.email,
-        password_hash
+        hash
     )
     .fetch_one(&state.pool)
     .await;
 
     let user_id = match result {
-        Ok(record) => record.id,
+        Ok(r) => r.id,
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return Err(AppError::Conflict("Email already exists".to_string()));
+            return Err(AppError::Conflict("Email already exists".into()));
         }
-        Err(e) => return Err(AppError::DatabaseError(e)),
+        Err(e) => return Err(e.into()),
     };
 
-    // 3. Generate JWT for new user
-    let expiration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let token = generate_jwt(user_id, &state.jwt_secret)?;
+    Ok((StatusCode::CREATED, Json(AuthResponse { token })))
+}
+
+fn generate_jwt(user_id: Uuid, secret: &str) -> Result<String, AppError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as usize
-        + (24 * 60 * 60);
+        .as_secs() as usize;
 
     let claims = Claims {
         sub: user_id.to_string(),
-        exp: expiration,
-        iat: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as usize,
+        iat: now,
+        exp: now + (JWT_EXPIRY_HOURS as usize * 3600),
     };
 
-    let token = encode(
+    encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        &EncodingKey::from_secret(secret.as_bytes()),
     )
-    .map_err(|e| AppError::InternalServerError(format!("Token creation failed: {}", e)))?;
+    .map_err(|e| AppError::Internal(e.to_string()))
+}
 
-    Ok((StatusCode::CREATED, Json(LoginResponse { token })))
+pub async fn protected(AuthUser { user_id }: AuthUser) -> impl IntoResponse {
+    format!("Welcome! Your ID is: {user_id}")
+}
+
+pub async fn get_history(
+    AuthUser { user_id }: AuthUser,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    Json(state.get_history(&user_id))
 }
 
 pub async fn ws_handler(
@@ -151,68 +134,112 @@ pub async fn ws_handler(
     Query(params): Query<WsQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // 1. Verify Token
-    let decoding_key = jsonwebtoken::DecodingKey::from_secret(state.jwt_secret.as_bytes());
     let validation = jsonwebtoken::Validation::default();
+    let key = jsonwebtoken::DecodingKey::from_secret(state.jwt_secret.as_bytes());
 
-    let claims = match jsonwebtoken::decode::<crate::models::Claims>(
-        &params.token,
-        &decoding_key,
-        &validation,
-    ) {
-        Ok(token_data) => token_data.claims,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid Token").into_response(),
+    let claims = match jsonwebtoken::decode::<Claims>(&params.token, &key, &validation) {
+        Ok(data) => data.claims,
+        Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid token").into_response(),
     };
 
     let user_id = match Uuid::parse_str(&claims.sub) {
-        Ok(uid) => uid,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid User ID").into_response(),
+        Ok(id) => id,
+        Err(_) => return (StatusCode::UNAUTHORIZED, "Invalid user ID").into_response(),
     };
 
-    // 2. Upgrade connection
     ws.on_upgrade(move |socket| handle_socket(socket, state, user_id))
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState, user_id: Uuid) {
-    // Split the socket into Sender and Receiver
-    let (mut sender, mut receiver) = socket.split();
+    let device_id = Uuid::new_v4().to_string();
+    tracing::info!(user = %user_id, device = %device_id, "device connected");
 
-    // 1. Get or Create the Broadcast Channel for this User
-    // If the user has no room, create one. If they do, grab a reference to it.
-    let tx = state
-        .hub
-        .entry(user_id)
-        .or_insert_with(|| {
-            let (tx, _rx) = broadcast::channel(100);
-            tx
-        })
-        .clone();
+    let (sender, receiver) = socket.split();
+    let sender = Arc::new(Mutex::new(sender));
 
-    // Subscribe to this channel (Create a unique Receiver for THIS device)
+    let tx = state.get_or_create_channel(user_id);
     let mut rx = tx.subscribe();
 
-    // 2. Spawn a Task to Forward Broadcasts -> Device
-    // "If another device sends a message, push it down my socket"
-    let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            // Send the encrypted payload to the client
-            if sender.send(Message::Text(msg.into())).await.is_err() {
+    let ping_sender = Arc::clone(&sender);
+    let ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+        loop {
+            interval.tick().await;
+            if ping_sender
+                .lock()
+                .await
+                .send(Message::Ping(vec![].into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     });
 
-    // 3. Listen for Messages from Device -> Broadcast
-    // "If I copy text, broadcast it to everyone else"
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            // Determine if this is a pong or real data?
-            // For V1, we assume all text is encrypted clipboard data.
-            let _ = tx.send(text.to_string());
+    let my_device = device_id.clone();
+    let broadcast_sender = Arc::clone(&sender);
+    let send_task = tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            if msg.device_id == my_device {
+                continue;
+            }
+            if let Ok(json) = serde_json::to_string(&msg) {
+                if broadcast_sender
+                    .lock()
+                    .await
+                    .send(Message::Text(json.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
         }
-    }); // 4. Wait for either task to finish (Disconnection)
+    });
+
+    let recv_task = tokio::spawn(handle_incoming(
+        receiver,
+        tx.clone(),
+        device_id,
+        state.clone(),
+        user_id,
+    ));
+
     tokio::select! {
-        _ = (&mut send_task) => recv_task.abort(),
-        _ = (&mut recv_task) => send_task.abort(),
-    };
+        _ = send_task => {},
+        _ = recv_task => {},
+        _ = ping_task => {},
+    }
+
+    state.cleanup_channel_if_empty(&user_id, &tx);
+}
+
+async fn handle_incoming(
+    mut receiver: futures::stream::SplitStream<WebSocket>,
+    tx: tokio::sync::broadcast::Sender<ClipboardMessage>,
+    device_id: String,
+    state: AppState,
+    user_id: Uuid,
+) {
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(text) => {
+                if !state.check_rate_limit(&device_id) {
+                    tracing::warn!(device = %device_id, "rate limited");
+                    continue;
+                }
+
+                let mut clipboard_msg = serde_json::from_str::<ClipboardMessage>(&text)
+                    .unwrap_or_else(|_| ClipboardMessage::new(&device_id, text.to_string()));
+
+                clipboard_msg.device_id = device_id.clone();
+                state.add_to_history(user_id, clipboard_msg.clone());
+                let _ = tx.send(clipboard_msg);
+            }
+            Message::Pong(_) => tracing::debug!(device = %device_id, "pong received"),
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
 }
