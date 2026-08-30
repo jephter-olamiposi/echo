@@ -7,6 +7,8 @@
 
 Copy on your laptop. Paste on your phone. Real-time clipboard sync across desktop and mobile, under 100ms — end-to-end encrypted. The server never sees your data. It receives ciphertext, stores ciphertext, forwards ciphertext. A blind relay.
 
+📖 Read the deep dive on dev.to: [Bridging QUIC and SIP: Building a Low-Latency Telephony Gateway in Rust](https://dev.to/iamjephter/bridging-quic-and-sip-building-a-low-latency-telephony-gateway-in-rust-4dd3).
+
 ![Echo dashboard — desktop and mobile in sync](assets/screenshot-dashboard.png)
 
 ![Echo login — desktop and mobile](assets/screenshot-login.png)
